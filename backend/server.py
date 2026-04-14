@@ -754,6 +754,78 @@ async def stripe_webhook(request: Request):
     
     return {"status": "ok"}
 
+# ============ PASSWORD RESET ============
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(req: ForgotPasswordRequest):
+    email = req.email.lower()
+    user = await db.users.find_one({"email": email})
+    if not user:
+        # Return success even if user doesn't exist (security best practice)
+        return {"message": "If an account with that email exists, a reset link has been sent.", "token": None}
+    
+    reset_token = secrets.token_urlsafe(32)
+    await db.password_reset_tokens.insert_one({
+        "user_id": str(user["_id"]),
+        "token": reset_token,
+        "email": email,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        "used": False
+    })
+    
+    logger.info(f"Password reset token for {email}: {reset_token}")
+    
+    # Send email via SendGrid if configured
+    sendgrid_key = os.environ.get("SENDGRID_API_KEY", "")
+    if sendgrid_key and sendgrid_key != "MOCK_KEY":
+        try:
+            from sendgrid import SendGridAPIClient
+            from sendgrid.helpers.mail import Mail
+            message = Mail(
+                from_email=os.environ.get("SENDER_EMAIL", "noreply@recruitit.com"),
+                to_emails=email,
+                subject="RecruitIT - Password Reset",
+                html_content=f"<h2>Password Reset</h2><p>Use this token to reset your password: <strong>{reset_token}</strong></p><p>This token expires in 1 hour.</p>"
+            )
+            sg = SendGridAPIClient(sendgrid_key)
+            sg.send(message)
+        except Exception as e:
+            logger.error(f"SendGrid error: {e}")
+    else:
+        logger.info(f"[MOCKED EMAIL] Password reset token for {email}: {reset_token}")
+    
+    return {"message": "If an account with that email exists, a reset link has been sent.", "token": reset_token}
+
+@api_router.post("/auth/reset-password")
+async def reset_password(req: ResetPasswordRequest):
+    if len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    
+    token_doc = await db.password_reset_tokens.find_one({"token": req.token, "used": False}, {"_id": 0})
+    if not token_doc:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+    
+    expires_at = datetime.fromisoformat(token_doc["expires_at"])
+    if datetime.now(timezone.utc) > expires_at:
+        raise HTTPException(status_code=400, detail="Reset token has expired")
+    
+    new_hash = hash_password(req.new_password)
+    await db.users.update_one(
+        {"_id": ObjectId(token_doc["user_id"])},
+        {"$set": {"password_hash": new_hash}}
+    )
+    await db.password_reset_tokens.update_one({"token": req.token}, {"$set": {"used": True}})
+    
+    return {"message": "Password reset successfully. You can now log in with your new password."}
+
 # ============ DASHBOARD ============
 
 @api_router.get("/dashboard/stats")
@@ -786,6 +858,124 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
         "pending_screening": pending_screening,
         "recent_jobs": recent_jobs,
         "recent_candidates": recent_candidates
+    }
+
+# ============ ANALYTICS ============
+
+@api_router.get("/analytics")
+async def get_analytics(user: dict = Depends(get_current_user)):
+    user_jobs = await db.jobs.find({"user_id": user["_id"]}).to_list(200)
+    job_ids = [str(j["_id"]) for j in user_jobs]
+    
+    all_candidates = await db.candidates.find({"job_id": {"$in": job_ids}}).to_list(1000)
+    
+    # 1. Pipeline funnel
+    total = len(all_candidates)
+    screened = sum(1 for c in all_candidates if c.get("screening_status") == "completed")
+    shortlisted = sum(1 for c in all_candidates if c.get("status") == "shortlisted")
+    rejected = sum(1 for c in all_candidates if c.get("status") == "rejected")
+    on_hold = sum(1 for c in all_candidates if c.get("status") == "hold")
+    
+    pipeline_funnel = [
+        {"stage": "Sourced", "count": total},
+        {"stage": "Screened", "count": screened},
+        {"stage": "Shortlisted", "count": shortlisted},
+        {"stage": "On Hold", "count": on_hold},
+        {"stage": "Rejected", "count": rejected},
+    ]
+    
+    # 2. Candidates per job
+    candidates_per_job = []
+    for job in user_jobs:
+        jid = str(job["_id"])
+        job_cands = [c for c in all_candidates if c.get("job_id") == jid]
+        job_shortlisted = sum(1 for c in job_cands if c.get("status") == "shortlisted")
+        candidates_per_job.append({
+            "job": job["title"][:25],
+            "total": len(job_cands),
+            "shortlisted": job_shortlisted,
+            "screened": sum(1 for c in job_cands if c.get("screening_status") == "completed"),
+        })
+    
+    # 3. Match score distribution
+    score_buckets = {"0-20": 0, "21-40": 0, "41-60": 0, "61-80": 0, "81-100": 0}
+    for c in all_candidates:
+        score = c.get("match_score", 0)
+        if score <= 20: score_buckets["0-20"] += 1
+        elif score <= 40: score_buckets["21-40"] += 1
+        elif score <= 60: score_buckets["41-60"] += 1
+        elif score <= 80: score_buckets["61-80"] += 1
+        else: score_buckets["81-100"] += 1
+    
+    match_score_distribution = [{"range": k, "count": v} for k, v in score_buckets.items()]
+    
+    # 4. Screening score distribution
+    screening_scores = []
+    for c in all_candidates:
+        if c.get("screening_score") is not None:
+            screening_scores.append({
+                "name": c.get("name", "")[:15],
+                "screening_score": c.get("screening_score", 0),
+                "match_score": c.get("match_score", 0),
+            })
+    screening_scores.sort(key=lambda x: x["screening_score"], reverse=True)
+    
+    # 5. Status breakdown (pie chart data)
+    status_counts = {}
+    for c in all_candidates:
+        s = c.get("status", "sourced")
+        status_counts[s] = status_counts.get(s, 0) + 1
+    status_breakdown = [{"status": k.capitalize(), "count": v} for k, v in status_counts.items()]
+    
+    # 6. Source breakdown
+    source_counts = {}
+    for c in all_candidates:
+        src = c.get("source", "Unknown")
+        source_counts[src] = source_counts.get(src, 0) + 1
+    source_breakdown = [{"source": k, "count": v} for k, v in source_counts.items()]
+    
+    # 7. Experience distribution
+    exp_buckets = {"0-2 yrs": 0, "3-5 yrs": 0, "6-8 yrs": 0, "9+ yrs": 0}
+    for c in all_candidates:
+        exp = c.get("experience", 0)
+        if exp <= 2: exp_buckets["0-2 yrs"] += 1
+        elif exp <= 5: exp_buckets["3-5 yrs"] += 1
+        elif exp <= 8: exp_buckets["6-8 yrs"] += 1
+        else: exp_buckets["9+ yrs"] += 1
+    experience_distribution = [{"range": k, "count": v} for k, v in exp_buckets.items()]
+    
+    # 8. Top performers
+    top_performers = sorted(
+        [c for c in all_candidates if c.get("screening_score") is not None],
+        key=lambda x: x.get("screening_score", 0),
+        reverse=True
+    )[:10]
+    top_performers_list = []
+    for c in top_performers:
+        top_performers_list.append({
+            "name": c.get("name", ""),
+            "screening_score": c.get("screening_score", 0),
+            "match_score": c.get("match_score", 0),
+            "status": c.get("status", ""),
+            "current_company": c.get("current_company", ""),
+        })
+    
+    return {
+        "pipeline_funnel": pipeline_funnel,
+        "candidates_per_job": candidates_per_job,
+        "match_score_distribution": match_score_distribution,
+        "screening_scores": screening_scores[:15],
+        "status_breakdown": status_breakdown,
+        "source_breakdown": source_breakdown,
+        "experience_distribution": experience_distribution,
+        "top_performers": top_performers_list,
+        "summary": {
+            "total_candidates": total,
+            "total_jobs": len(user_jobs),
+            "avg_match_score": round(sum(c.get("match_score", 0) for c in all_candidates) / max(total, 1), 1),
+            "avg_screening_score": round(sum(c.get("screening_score", 0) for c in all_candidates if c.get("screening_score")) / max(screened, 1), 1),
+            "shortlist_rate": round(shortlisted / max(total, 1) * 100, 1),
+        }
     }
 
 # ============ STARTUP ============
