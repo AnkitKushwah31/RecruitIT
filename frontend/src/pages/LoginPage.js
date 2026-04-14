@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, Navigate } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import { formatApiError } from "../lib/api";
 import { motion } from "framer-motion";
@@ -19,8 +19,7 @@ export default function LoginPage() {
   const [error, setError] = useState("");
 
   if (user) {
-    navigate("/dashboard", { replace: true });
-    return null;
+    return <Navigate to="/dashboard" replace />;
   }
 
   const handleSubmit = async (e) => {
