@@ -1,6 +1,8 @@
 from dotenv import load_dotenv
 from pathlib import Path
 
+import jwt
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -18,7 +20,9 @@ import jwt
 from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from anthropic import AsyncAnthropic
+import json
+import stripe
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -355,28 +359,28 @@ SAMPLE_CANDIDATES = [
 async def generate_ai_match_score(job_skills: List[str], candidate: dict) -> dict:
     """Use Claude to generate a match score and analysis for a candidate"""
     try:
-        chat = LlmChat(
-            api_key=os.environ.get("EMERGENT_LLM_KEY", ""),
-            session_id=f"scoring-{uuid.uuid4()}",
-            system_message="You are an expert recruiter AI. Evaluate candidate fit and return JSON only."
-        ).with_model("anthropic", "claude-sonnet-4-5-20250929")
+        client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
         
-        msg = UserMessage(text=f"""Evaluate this candidate for a job requiring these skills: {', '.join(job_skills)}.
+        prompt = f"""Evaluate this candidate for a job requiring these skills: {', '.join(job_skills)}.
 Candidate: {candidate['name']}, {candidate['experience']} years experience at {candidate['current_company']}, located in {candidate['location']}.
-Return ONLY valid JSON: {{"match_score": <0-100>, "matching_skills": [<list of likely matching skills>], "summary": "<1 sentence>"}}""")
+Return ONLY valid JSON (no markdown, no code blocks): {{"match_score": <0-100>, "matching_skills": [<list of likely matching skills>], "summary": "<1 sentence>"}}"""
         
-        response = await chat.send_message(msg)
-        import json
+        response = await client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=500,
+            system="You are an expert recruiter AI. Evaluate candidate fit and return JSON only.",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        text = response.content[0].text.strip()
         # Try to parse JSON from response
-        text = response.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
         return json.loads(text)
     except Exception as e:
         logger.error(f"AI scoring error: {e}")
-        import random
         return {
-            "match_score": random.randint(40, 95),
+            "match_score": 65,
             "matching_skills": job_skills[:3] if len(job_skills) >= 3 else job_skills,
             "summary": f"Experienced professional with {candidate['experience']} years in the industry."
         }
@@ -469,13 +473,9 @@ async def screen_candidate(candidate_id: str, user: dict = Depends(get_current_u
     await db.candidates.update_one({"_id": ObjectId(candidate_id)}, {"$set": {"screening_status": "in_progress"}})
     
     try:
-        chat = LlmChat(
-            api_key=os.environ.get("EMERGENT_LLM_KEY", ""),
-            session_id=f"screen-{candidate_id}",
-            system_message="You are an expert technical recruiter conducting a screening interview. Be thorough but fair."
-        ).with_model("anthropic", "claude-sonnet-4-5-20250929")
+        client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
         
-        msg = UserMessage(text=f"""Simulate a phone screening interview for this candidate and provide results.
+        prompt = f"""Simulate a phone screening interview for this candidate and provide results.
 
 Job: {job['title']}
 Description: {job['description']}
@@ -488,7 +488,7 @@ Current Company: {candidate['current_company']}
 Location: {candidate['location']}
 Match Score: {candidate.get('match_score', 'N/A')}
 
-Generate a realistic screening call transcript and evaluation. Return ONLY valid JSON:
+Generate a realistic screening call transcript and evaluation. Return ONLY valid JSON (no markdown, no code blocks):
 {{
     "transcript": "<simulated 3-4 Q&A exchange as a string>",
     "screening_score": <0-100>,
@@ -496,11 +496,16 @@ Generate a realistic screening call transcript and evaluation. Return ONLY valid
     "strengths": ["<strength1>", "<strength2>"],
     "weaknesses": ["<weakness1>"],
     "notes": "<brief evaluator notes>"
-}}""")
+}}"""
         
-        response = await chat.send_message(msg)
-        import json
-        text = response.strip()
+        response = await client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=1500,
+            system="You are an expert technical recruiter conducting a screening interview. Be thorough but fair.",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        text = response.content[0].text.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
         result = json.loads(text)
@@ -667,88 +672,118 @@ async def create_checkout(req: CheckoutRequest, request: Request, user: dict = D
     if not plan:
         raise HTTPException(status_code=400, detail="Invalid plan")
     
-    from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionRequest
-    
     stripe_key = os.environ.get("STRIPE_API_KEY", "")
-    host_url = req.origin_url.rstrip("/")
-    webhook_url = f"{str(request.base_url).rstrip('/')}/api/webhook/stripe"
+    if not stripe_key:
+        raise HTTPException(status_code=500, detail="Stripe API key not configured")
     
-    stripe_checkout = StripeCheckout(api_key=stripe_key, webhook_url=webhook_url)
+    stripe.api_key = stripe_key
+    host_url = req.origin_url.rstrip("/")
     
     success_url = f"{host_url}/settings?session_id={{CHECKOUT_SESSION_ID}}&payment=success"
     cancel_url = f"{host_url}/settings?payment=cancelled"
     
-    checkout_req = CheckoutSessionRequest(
-        amount=plan["amount"],
-        currency="usd",
-        success_url=success_url,
-        cancel_url=cancel_url,
-        metadata={"user_id": user["_id"], "plan_id": req.plan_id, "plan_name": plan["name"]}
-    )
-    
-    session = await stripe_checkout.create_checkout_session(checkout_req)
-    
-    await db.payment_transactions.insert_one({
-        "session_id": session.session_id,
-        "user_id": user["_id"],
-        "plan_id": req.plan_id,
-        "amount": plan["amount"],
-        "currency": "usd",
-        "payment_status": "initiated",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    })
-    
-    return {"url": session.url, "session_id": session.session_id}
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {
+                        "name": plan["name"],
+                        "description": f"RecruitIT {plan['name']} Plan"
+                    },
+                    "unit_amount": int(plan["amount"] * 100)  # Stripe uses cents
+                },
+                "quantity": 1
+            }],
+            mode="payment",
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={"user_id": str(user["_id"]), "plan_id": req.plan_id, "plan_name": plan["name"]}
+        )
+        
+        await db.payment_transactions.insert_one({
+            "session_id": session.id,
+            "user_id": user["_id"],
+            "plan_id": req.plan_id,
+            "amount": plan["amount"],
+            "currency": "usd",
+            "payment_status": "initiated",
+            "created_at": datetime.now(timezone.utc).isoformat()
+        })
+        
+        return {"url": session.url, "session_id": session.id}
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe error: {e}")
+        raise HTTPException(status_code=500, detail=f"Payment error: {str(e)}")
 
 @api_router.get("/subscription/status/{session_id}")
 async def check_subscription_status(session_id: str, user: dict = Depends(get_current_user)):
-    from emergentintegrations.payments.stripe.checkout import StripeCheckout
-    
     stripe_key = os.environ.get("STRIPE_API_KEY", "")
-    stripe_checkout = StripeCheckout(api_key=stripe_key, webhook_url="")
+    if not stripe_key:
+        raise HTTPException(status_code=500, detail="Stripe API key not configured")
     
-    status = await stripe_checkout.get_checkout_status(session_id)
+    stripe.api_key = stripe_key
     
-    tx = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
-    
-    if status.payment_status == "paid" and tx and tx.get("payment_status") != "paid":
-        plan_id = tx.get("plan_id", "starter")
-        plan = SUBSCRIPTION_PLANS.get(plan_id, SUBSCRIPTION_PLANS["starter"])
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+        tx = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
         
-        await db.payment_transactions.update_one(
-            {"session_id": session_id},
-            {"$set": {"payment_status": "paid", "paid_at": datetime.now(timezone.utc).isoformat()}}
-        )
-        await db.users.update_one(
-            {"_id": ObjectId(tx["user_id"])},
-            {"$set": {"subscription": {"plan": plan_id, "status": "active", "plan_name": plan["name"]}}}
-        )
-    
-    return {
-        "status": status.status,
-        "payment_status": status.payment_status,
-        "amount_total": status.amount_total,
-        "currency": status.currency
-    }
+        if session.payment_status == "paid" and tx and tx.get("payment_status") != "paid":
+            plan_id = tx.get("plan_id", "starter")
+            plan = SUBSCRIPTION_PLANS.get(plan_id, SUBSCRIPTION_PLANS["starter"])
+            
+            await db.payment_transactions.update_one(
+                {"session_id": session_id},
+                {"$set": {"payment_status": "paid", "paid_at": datetime.now(timezone.utc).isoformat()}}
+            )
+            await db.users.update_one(
+                {"_id": ObjectId(tx["user_id"])},
+                {"$set": {"subscription": {"plan": plan_id, "status": "active", "plan_name": plan["name"]}}}
+            )
+        
+        return {
+            "status": session.status,
+            "payment_status": session.payment_status,
+            "amount_total": session.amount_total,
+            "currency": session.currency
+        }
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe error: {e}")
+        raise HTTPException(status_code=500, detail=f"Payment lookup error: {str(e)}")
 
 @api_router.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
     body = await request.body()
     sig = request.headers.get("Stripe-Signature", "")
+    endpoint_secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+    
+    if not endpoint_secret:
+        logger.warning("Stripe webhook secret not configured")
+        return {"status": "ok"}
+    
     logger.info(f"Stripe webhook received")
     
     try:
-        from emergentintegrations.payments.stripe.checkout import StripeCheckout
-        stripe_key = os.environ.get("STRIPE_API_KEY", "")
-        stripe_checkout = StripeCheckout(api_key=stripe_key, webhook_url="")
-        webhook_response = await stripe_checkout.handle_webhook(body, sig)
+        stripe.api_key = os.environ.get("STRIPE_API_KEY", "")
+        event = stripe.Webhook.construct_event(body, sig, endpoint_secret)
         
-        if webhook_response.payment_status == "paid":
-            await db.payment_transactions.update_one(
-                {"session_id": webhook_response.session_id},
-                {"$set": {"payment_status": "paid", "paid_at": datetime.now(timezone.utc).isoformat()}}
-            )
-        logger.info(f"Webhook processed: {webhook_response.event_type}")
+        # Handle checkout.session.completed event
+        if event["type"] == "checkout.session.completed":
+            session = event["data"]["object"]
+            if session["payment_status"] == "paid":
+                await db.payment_transactions.update_one(
+                    {"session_id": session["id"]},
+                    {"$set": {"payment_status": "paid", "paid_at": datetime.now(timezone.utc).isoformat()}}
+                )
+                logger.info(f"Payment confirmed for session: {session['id']}")
+        
+        logger.info(f"Webhook processed: {event['type']}")
+    except stripe.error.SignatureVerificationError as e:
+        logger.error(f"Webhook signature verification failed: {e}")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe webhook error: {e}")
     except Exception as e:
         logger.error(f"Webhook error: {e}")
     
